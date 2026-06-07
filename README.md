@@ -1,121 +1,146 @@
-# festbot
+# festy
 
-A Discord bot for coordinating multi-trip festival logistics. Built for groups who attend multiple festivals together with overlapping-but-different rosters.
+A slim Discord bot for coordinating festival attendance + logistics for a friend group.
+No database, no Docker — one Python file, run as a systemd service on a Raspberry Pi.
 
-## Architecture at a glance
+## How it works
 
-- **One Discord server**, many trips (EDC 2026, Lost Lands 2026, etc.)
-- **Each trip = a Discord category + role + rows in the DB**
-- **Channel-scoped commands**: the bot figures out which trip you mean from the channel you ran the command in
-- **Native Discord permissions**: channel visibility gates access — if you're not in the trip role, you don't see the channel, you can't run commands
+- **One festival = one role + one private category + channels.** The role and
+  category share a name; that's how the bot maps a channel back to its festival.
+- **Visibility is gated by the category's permissions:** `@everyone → view off`,
+  `festival role → view on`. No role means you don't see the channels.
+- **The roster IS the role's member list.** There's no database — "who's going"
+  is literally who has the role.
+- **All mutating commands are admin-only.** Members have no command that grants
+  themselves a role; people are added by an admin via `/festival add`.
+- **Logistics** (dates, lodging, packing) live in pinned messages in `#logistics`.
 
-## Stack
+## Commands
 
-- Python 3.11+ / discord.py 2.x
-- Supabase (Postgres) for persistence
-- APScheduler for reminders and countdowns
-- Docker Compose for deployment on tandu
+All under `/festival`. Admin-only except `roster`.
 
-## Phase 1 features (this repo)
+| Command | Who | What |
+| --- | --- | --- |
+| `/festival create name:` | admin | Creates the role, a private category, and `#general #logistics #carpools`. Run anywhere. |
+| `/festival add member:` | admin | Adds someone to the festival of the current channel (assigns the role). |
+| `/festival remove member:` | admin | Removes someone from the festival. |
+| `/festival roster` | attendees | Embed of who's going + headcount. |
+| `/festival list` | admin | All festivals with headcounts. |
+| `/festival archive` | admin | Locks a festival read-only when it's over (non-destructive). |
 
-- `/trip create | link | info | list | archive` — trip setup (admin)
-- `/roster` — who's going, arrival/departure, rideshare flag
-- `/lodging` — rooms/tents/Airbnbs with per-person cost split
-- `/packing` — group + personal packing checklists
-- Daily countdown messages per trip
+`add`, `remove`, `roster`, and `archive` infer which festival you mean from the
+channel's category — run them inside the festival's channels.
 
-Phase 2 (`/schedule`, `/meetup`, `/expense`) and Phase 3 (`/poll`, memory threads) live on the roadmap — architecture is ready for them.
+## Admins
+
+A user is an admin if they have the **`festival-admin`** role (configurable via
+`ADMIN_ROLE_NAME`) **or** Discord's **Manage Server** permission. Create the role
+in Server Settings → Roles and assign it to whoever should manage trips —
+multiple people is fine.
 
 ## Setup
 
-### 1. Create the Discord app
+### 1. Discord application
 
-1. Go to https://discord.com/developers/applications, New Application
-2. Bot → Reset Token, copy it
-3. Privileged Gateway Intents: enable **Server Members Intent**
-4. OAuth2 → URL Generator → scopes: `bot`, `applications.commands` → permissions: Manage Roles, Manage Channels, Send Messages, Embed Links, Read Message History, Use Slash Commands
-5. Invite the bot to your server with the generated URL
+1. <https://discord.com/developers/applications> → New Application
+2. **Bot → Reset Token**, copy it
+3. **Bot → Privileged Gateway Intents → enable Server Members Intent**
+4. **OAuth2 → URL Generator**
+   - Scopes: `bot`, `applications.commands`
+   - Bot Permissions: Manage Roles, Manage Channels, View Channels, Send
+     Messages, Embed Links, Read Message History, Use Slash Commands
+5. Open the generated URL and invite the bot to your server.
 
-### 2. Create the Supabase project
+### 2. Role hierarchy (important)
 
-1. New project at supabase.com (free tier is fine)
-2. SQL Editor → paste `migrations/001_init.sql` → run
-3. Project Settings → API → copy the URL and the `service_role` key (bot needs write access; we use RLS-bypassing service role and enforce access in bot code)
+In **Server Settings → Roles**, drag the **bot's own role above** the festival
+roles. If it sits below them, `add`/`remove` fail with a Forbidden error. This is
+the most common first-run problem.
 
-### 3. Configure environment
+### 3. Configure `.env`
+
+Create `.env` next to `bot.py`. No quotes, no spaces around `=`, no inline
+comments (systemd's `EnvironmentFile` is strict).
+
+```
+DISCORD_TOKEN=your-bot-token
+GUILD_ID=your-server-id
+ADMIN_ROLE_NAME=festival-admin
+```
+
+`GUILD_ID`: enable Developer Mode (Discord Settings → Advanced), then right-click
+your server icon → Copy Server ID.
+
+### 4. Install
 
 ```bash
-cp .env.example .env
-# edit .env with your tokens
+cd ~/festy
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
-Required:
-- `DISCORD_TOKEN` — bot token
-- `DISCORD_GUILD_ID` — your server ID (for instant slash command registration during dev)
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_KEY`
-- `ADMIN_ROLE_NAME` — defaults to `festival-admin`
-
-### 4. Create the admin role in Discord
-
-Create a role called `festival-admin` (or whatever you set `ADMIN_ROLE_NAME` to) and give it to yourself + anyone who should manage trips.
-
-### 5. Deploy to tandu
+Test it runs before installing the service:
 
 ```bash
-# from your machine
-rsync -av ./ brandon@tandu.tailbe47ed.ts.net:~/festbot/
-ssh brandon@tandu.tailbe47ed.ts.net
-cd ~/festbot
-docker compose up -d --build
-docker compose logs -f
+.venv/bin/python bot.py
 ```
 
-Then add a monitor in Uptime Kuma pointing at `http://tandu.tailbe47ed.ts.net:8765/health`.
+You should see `Logged in as ...` and `Slash commands synced to guild ...`.
+Ctrl+C to stop.
 
-## First-time usage
+### 5. Run 24/7 with systemd
 
-```
-# as an admin, in any channel:
-/trip create name:"EDC 2026" start:2026-05-15 end:2026-05-17 festival:"EDC Las Vegas"
-# bot creates category, role, channels, and links them
+Edit `festy.service` so `User` and the paths match your Pi (username and the
+`/home/<user>/festy` directory), then:
 
-# anyone with the trip role can now:
-/roster              # shows current roster with Join/Leave buttons
-/lodging list        # shows lodging assignments
-/packing list        # shows the packing checklist
-```
-
-## Project layout
-
-```
-bot/
-  main.py              # entry point, loads cogs, starts scheduler + healthcheck
-  config.py            # env var loading
-  db/
-    client.py          # Supabase client singleton
-    queries.py         # all SQL in one place (easier to review/audit)
-  utils/
-    checks.py          # decorators: in_trip_channel, is_trip_member, is_admin
-    embeds.py          # shared embed styling
-    scheduler.py       # APScheduler setup
-  cogs/
-    trips.py           # /trip ...
-    roster.py          # /roster
-    lodging.py         # /lodging ...
-    packing.py         # /packing ...
-    countdown.py       # daily countdown scheduled task
-migrations/
-  001_init.sql         # schema
-Dockerfile
-docker-compose.yml
-requirements.txt
-.env.example
+```bash
+sudo cp festy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now festy
+systemctl status festy
 ```
 
-## Notes for future-me
+`enable` starts it on every boot; `Restart=on-failure` relaunches it on a crash.
+As long as the Pi has power and internet, the bot stays up.
 
-- Slash commands are registered to `DISCORD_GUILD_ID` for instant updates during dev. To go global, call `tree.sync()` without a guild arg — propagation takes up to an hour.
-- The bot uses the Supabase **service_role** key and bypasses RLS. Access control is enforced in `utils/checks.py`. If you ever expose a web UI, switch to anon key + RLS.
-- `bot/db/queries.py` centralizes all SQL. Keeps it easy to reason about what the bot can read/write.
-- Healthcheck endpoint on port 8765 is there so Uptime Kuma can alert you when the bot dies.
+## Usage
+
+```
+# as an admin, anywhere:
+/festival create name:"EDC 2026"
+
+# then inside one of its channels (e.g. #general):
+/festival add member:@friend
+/festival roster
+```
+
+## Day-to-day commands
+
+```bash
+systemctl status festy          # is it running?
+sudo systemctl restart festy    # after editing bot.py or .env
+journalctl -u festy -f          # tail logs
+journalctl -u festy -n 50       # last 50 log lines
+```
+
+## Requirements
+
+- Raspberry Pi (or any Linux box) with Python 3.11+
+- `discord.py >= 2.3`, `python-dotenv >= 1.0`
+- On Python 3.13+, also `audioop-lts` (the stdlib `audioop` module was removed in
+  3.13 and discord.py depends on it).
+
+## Design notes / limits
+
+- **No database by design.** State lives in Discord (roles, channels, pinned
+  messages). This keeps deployment to a single file.
+- The point where you'd need to add SQLite is when you want the bot to *compute
+  or query* over data — expense balances, "who still needs a ride," reports
+  across trips. Roles and pinned messages can't do that. Until then, stay slim.
+- **Native Discord Events are not used.** External/IRL events are visible
+  server-wide regardless of channel permissions, which would leak a festival's
+  existence to non-attendees. Dates go in pinned messages in `#logistics`
+  instead.
+- `archive` is intentionally non-destructive: it locks channels read-only and
+  prepends `[archived]` to the category. Delete roles/channels by hand if you
+  want them fully gone, so a misfired command can't nuke history.
